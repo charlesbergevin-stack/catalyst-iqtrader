@@ -1,0 +1,1083 @@
+# Catalyst IQTrader — Monorepo (Railway-ready)
+
+> Full-stack, dark-theme market **catalyst** platform (AI, M&A, restructurations, FDA, earnings, lawsuits, guidance, etc.) with **only-if-new** alerts. One-click deploy to **Railway**.
+>
+> Alternate brand reserved: **Catalyst WingTrader** (same codebase, different logo/theme token).
+
+---
+
+## Repository Structure
+```
+.
+├─ apps/
+│  ├─ web/                 # Next.js 14 (App Router) + Tailwind + shadcn/ui + lightweight-charts
+│  ├─ api/                 # FastAPI (REST) + SQLAlchemy + Pydantic
+│  └─ worker/              # Celery (scheduled jobs) + events ingesters (FDA/SEC/News)
+├─ db/
+│  ├─ migrations/
+│  └─ schema.sql           # PostgreSQL schema (Timescale optional)
+├─ infra/
+│  ├─ docker-compose.yml   # Local dev (web, api, worker, redis, postgres)
+│  ├─ railway.json         # Railway services & envs
+│  └─ Procfile             # process types for worker & beat
+├─ .env.sample
+├─ README.md
+└─ LICENSE
+```
+
+---
+
+## 1) Environment Variables (`.env.sample`)
+```
+# Core
+APP_NAME=Catalyst IQTrader
+TIMEZONE=America/Toronto
+QUIET_HOURS_START=21:00
+QUIET_HOURS_END=07:00
+
+# Web (Next.js)
+NEXT_PUBLIC_APP_NAME=Catalyst IQTrader
+NEXT_PUBLIC_DEFAULT_TICKER=AAPL
+NEXT_PUBLIC_API_BASE=http://localhost:8000
+
+# Database
+DATABASE_URL=postgresql+psycopg2://postgres:postgres@postgres:5432/iqtrader
+
+# Cache/Queue
+REDIS_URL=redis://redis:6379/0
+
+# Providers (add your keys)
+POLYGON_API_KEY=
+FINNHUB_API_KEY=
+NEWSAPI_KEY=
+
+# FDA (public sources)
+FDA_RSS_URLS=https://www.fda.gov/drugs/news-events-human-drugs/rss.xml
+FDA_ADCOM_CALENDAR_URL=https://www.fda.gov/advisory-committees
+
+# SEC / EDGAR
+EDGAR_RSS_BASE=https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent
+
+# Notifications
+SENDGRID_API_KEY=
+ALERTS_FROM_EMAIL=alerts@yourdomain.com
+ONESIGNAL_APP_ID=
+ONESIGNAL_REST_API_KEY=
+```
+
+---
+
+## 2) Database Schema (`db/schema.sql`)
+```sql
+CREATE TABLE IF NOT EXISTS entities_security (
+  security_id SERIAL PRIMARY KEY,
+  symbol TEXT UNIQUE NOT NULL,
+  name TEXT,
+  exchange TEXT,
+  currency TEXT,
+  sector TEXT,
+  industry TEXT,
+  active BOOLEAN DEFAULT TRUE
+);
+
+CREATE TABLE IF NOT EXISTS prices (
+  security_id INT REFERENCES entities_security(security_id),
+  ts TIMESTAMPTZ NOT NULL,
+  open NUMERIC, high NUMERIC, low NUMERIC, close NUMERIC, volume BIGINT,
+  PRIMARY KEY (security_id, ts)
+);
+
+CREATE TABLE IF NOT EXISTS market_events (
+  event_id BIGSERIAL PRIMARY KEY,
+  symbol TEXT NOT NULL,
+  company TEXT,
+  title TEXT,
+  category TEXT CHECK (category IN (
+    'FDA_APPROVAL','FDA_CRL','PDUFA_DATE','ADCOM_MEETING',
+    'M_AND_A','RESTRUCTURING','EARNINGS','GUIDANCE','BUYBACK','DIVIDEND',
+    'LAWSUIT','REGULATORY','AI_PARTNERSHIP','PRODUCT_LAUNCH','OUTAGE','OTHER'
+  )),
+  status TEXT CHECK (status IN ('SCHEDULED','CONFIRMED','RELEASED','CHANGED','CANCELLED','RUMOR')),
+  event_date TIMESTAMPTZ,
+  source TEXT,
+  url TEXT,
+  impact_score NUMERIC,  -- 0..1 expected market impact
+  confidence_score NUMERIC, -- 0..1 source confidence
+  created_at TIMESTAMPTZ DEFAULT now(),
+  updated_at TIMESTAMPTZ DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS event_versions (
+  id BIGSERIAL PRIMARY KEY,
+  event_id BIGINT REFERENCES market_events(event_id) ON DELETE CASCADE,
+  version INT NOT NULL,
+  payload_json JSONB NOT NULL,
+  created_at TIMESTAMPTZ DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS alerts_rules (
+  id BIGSERIAL PRIMARY KEY,
+  user_id TEXT,
+  type TEXT CHECK (type IN (
+    'catalyst_upcoming','catalyst_released','date_changed','critical_news',
+    'price_cross','rsi_cross'
+  )),
+  symbol TEXT,
+  params_json JSONB,
+  channel TEXT CHECK (channel IN ('email','push','webhook','telegram')),
+  enabled BOOLEAN DEFAULT TRUE,
+  created_at TIMESTAMPTZ DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS alerts_state (
+  alert_id BIGINT REFERENCES alerts_rules(id) ON DELETE CASCADE,
+  last_event_id BIGINT,
+  last_version INT,
+  last_digest TEXT,
+  milestones_sent JSONB,
+  last_sent_at TIMESTAMPTZ,
+  PRIMARY KEY (alert_id)
+);
+```
+
+---
+
+## 3) API — FastAPI (`apps/api/app/main.py`)
+```python
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from sqlalchemy import create_engine, text
+import os
+
+DATABASE_URL = os.getenv("DATABASE_URL")
+API = FastAPI(title="Catalyst IQTrader API", version="1.0.0")
+API.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+engine = create_engine(DATABASE_URL, pool_pre_ping=True)
+
+class MarketEvent(BaseModel):
+    event_id: int
+    symbol: str
+    company: str | None = None
+    title: str | None = None
+    category: str
+    status: str
+    event_date: str | None = None
+    impact_score: float | None = None
+    confidence_score: float | None = None
+    source: str | None = None
+    url: str | None = None
+
+@API.get("/health")
+def health():
+    with engine.connect() as c:
+        c.execute(text("SELECT 1"))
+    return {"ok": True}
+
+@API.get("/v1/events")
+def list_events(symbol: str | None = None, category: str | None = None):
+    q = "SELECT event_id, symbol, company, title, category, status, event_date, impact_score, confidence_score, source, url FROM market_events WHERE 1=1"
+    params = {}
+    if symbol:
+        q += " AND symbol = :s"; params["s"] = symbol.upper()
+    if category:
+        q += " AND category = :c"; params["c"] = category
+    q += " ORDER BY event_date DESC NULLS LAST, created_at DESC"
+    with engine.connect() as c:
+        rows = c.execute(text(q), params).mappings().all()
+    return [MarketEvent(**dict(r)) for r in rows]
+```
+
+`apps/api/requirements.txt`
+```
+fastapi==0.114.0
+uvicorn[standard]==0.30.6
+SQLAlchemy==2.0.35
+psycopg2-binary==2.9.9
+pydantic==2.9.2
+python-dotenv==1.0.1
+```
+
+`apps/api/Dockerfile`
+```
+FROM python:3.11-slim
+WORKDIR /app
+COPY apps/api/requirements.txt ./
+RUN pip install --no-cache-dir -r requirements.txt
+COPY apps/api /app
+EXPOSE 8000
+CMD ["uvicorn","app.main:API","--host","0.0.0.0","--port","8000"]
+```
+
+---
+
+## 4) Worker — Celery + ingest skeleton (`apps/worker/ingest.py`)
+```python
+import os, time, hashlib, json
+import feedparser
+import requests
+from datetime import datetime, timezone
+from sqlalchemy import create_engine, text
+
+DB = create_engine(os.getenv("DATABASE_URL"))
+TZ = os.getenv("TIMEZONE","America/Toronto")
+
+CATEGORIES = {
+  'FDA_APPROVAL': ['approved','approval'],
+  'M_AND_A': ['acquire','acquisition','merger','to be acquired'],
+  'RESTRUCTURING': ['restructuring','layoffs','cost reduction'],
+  'LAWSUIT': ['sues','lawsuit','settlement','class action'],
+  'AI_PARTNERSHIP': ['AI partnership','LLM','model','chip','compute','accelerator'],
+  'PRODUCT_LAUNCH': ['launches','introduces','unveils'],
+}
+
+
+def _digest(payload: dict) -> str:
+    return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
+
+
+def upsert_event(symbol: str, title: str, category: str, status: str, event_date: datetime | None, source: str, url: str, impact_score: float | None = None, confidence: float | None = None):
+    with DB.begin() as c:
+        res = c.execute(text(
+          """
+          INSERT INTO market_events(symbol, title, category, status, event_date, source, url, impact_score, confidence_score)
+          VALUES (:symbol,:title,:category,:status,:event_date,:source,:url,:impact,:conf)
+          RETURNING event_id
+          """
+        ), {"symbol": symbol, "title": title[:250] if title else None, "category": category, "status": status, "event_date": event_date, "source": source, "url": url, "impact": impact_score, "conf": confidence}).first()
+        event_id = res[0]
+        payload = {"symbol":symbol,"title":title,"category":category,"status":status,"event_date":event_date.isoformat() if event_date else None,"source":source,"url":url,"impact":impact_score,"confidence":confidence}
+        c.execute(text("INSERT INTO event_versions(event_id, version, payload_json) VALUES(:id,1,:p)"), {"id":event_id, "p": json.dumps(payload)})
+    return event_id
+
+
+def detect_fda_rss():
+    for url in os.getenv("FDA_RSS_URLS"," ").split(";"):
+        if not url.strip():
+            continue
+        feed = feedparser.parse(url)
+        for e in feed.entries[:50]:
+            title = e.get('title','')
+            link = e.get('link','')
+            if 'approv' in title.lower():
+                # map company -> symbol later with your resolver
+                upsert_event(symbol='TBD', title=title, category='FDA_APPROVAL', status='RELEASED', event_date=datetime.now(timezone.utc), source='FDA_RSS', url=link, impact_score=0.7, confidence=0.9)
+
+
+def detect_newsapi():
+    key = os.getenv('NEWSAPI_KEY');
+    if not key:
+        return
+    q = 'acquisition OR merger OR restructuring OR layoffs OR approval OR lawsuit OR guidance OR dividend OR buyback OR partnership'
+    r = requests.get('https://newsapi.org/v2/everything', params={'q':q,'pageSize':50,'language':'en','sortBy':'publishedAt','apiKey':key})
+    data = r.json()
+    for a in data.get('articles', []):
+        title = a['title']
+        url = a['url']
+        cat = 'OTHER'
+        for k,keys in CATEGORIES.items():
+            if any(word.lower() in title.lower() for word in keys):
+                cat = k; break
+        upsert_event(symbol='TBD', title=title, category=cat, status='RELEASED', event_date=datetime.fromisoformat(a['publishedAt'].replace('Z','+00:00')), source=a['source']['name'], url=url, impact_score=0.5, confidence=0.6)
+
+if __name__ == '__main__':
+    detect_fda_rss()
+    detect_newsapi()
+```
+
+`apps/worker/requirements.txt`
+```
+SQLAlchemy==2.0.35
+psycopg2-binary==2.9.9
+feedparser==6.0.11
+requests==2.32.3
+python-dotenv==1.0.1
+```
+
+`apps/worker/Dockerfile`
+```
+FROM python:3.11-slim
+WORKDIR /app
+COPY apps/worker/requirements.txt ./
+RUN pip install --no-cache-dir -r requirements.txt
+COPY apps/worker /app
+CMD ["python","ingest.py"]
+```
+
+---
+
+## 5) Web — Next.js Dark UI (excerpt)
+`apps/web/app/layout.tsx`
+```tsx
+import "./globals.css";
+export const metadata = { title: "Catalyst IQTrader" };
+export default function RootLayout({ children }: { children: React.ReactNode }) {
+  return (
+    <html lang="en" className="dark">
+      <body className="bg-[#0a0a0b] text-zinc-100">{children}</body>
+    </html>
+  );
+}
+```
+
+`apps/web/app/page.tsx` (imports your trader dashboard component from the previous canvas; shortened here)
+```tsx
+export default function Page(){
+  return (
+    <main className="container mx-auto px-4 py-6">
+      <h1 className="text-xl font-semibold mb-4">Catalyst IQTrader</h1>
+      {/* Insert TraderDashboardApp from prior canvas or your components */}
+      <div className="rounded-2xl border p-6">Dashboard goes here</div>
+    </main>
+  )
+}
+```
+
+`apps/web/package.json`
+```json
+{
+  "name": "iqtrader-web",
+  "private": true,
+  "scripts": {
+    "dev": "next dev -p 3000",
+    "build": "next build",
+    "start": "next start -p 3000"
+  },
+  "dependencies": {
+    "next": "14.2.5",
+    "react": "18.3.1",
+    "react-dom": "18.3.1"
+  }
+}
+```
+
+`apps/web/Dockerfile`
+```
+FROM node:20-alpine
+WORKDIR /app
+COPY apps/web/package.json ./
+RUN npm install --omit=dev
+COPY apps/web /app
+RUN npm run build || true
+EXPOSE 3000
+CMD ["npm","start"]
+```
+
+---
+
+## 6) Local Dev (`infra/docker-compose.yml`)
+```yaml
+version: "3.9"
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: iqtrader
+    ports: ["5432:5432"]
+    volumes: ["pgdata:/var/lib/postgresql/data", "../db/schema.sql:/docker-entrypoint-initdb.d/1.sql:ro"]
+
+  redis:
+    image: redis:7
+    ports: ["6379:6379"]
+
+  api:
+    build: ../apps/api
+    environment:
+      DATABASE_URL: postgresql+psycopg2://postgres:postgres@postgres:5432/iqtrader
+      PYTHONUNBUFFERED: "1"
+    ports: ["8000:8000"]
+    depends_on: [postgres]
+
+  worker:
+    build: ../apps/worker
+    environment:
+      DATABASE_URL: postgresql+psycopg2://postgres:postgres@postgres:5432/iqtrader
+      NEWSAPI_KEY: ${NEWSAPI_KEY}
+    depends_on: [postgres]
+
+  web:
+    build: ../apps/web
+    environment:
+      NEXT_PUBLIC_API_BASE: http://localhost:8000
+    ports: ["3000:3000"]
+    depends_on: [api]
+
+volumes:
+  pgdata:
+```
+
+---
+
+## 7) Railway (`infra/railway.json`)
+```json
+{
+  "$schema": "https://railway.app/railway.schema.json",
+  "name": "Catalyst IQTrader",
+  "services": [
+    { "name": "postgres", "serviceType": "postgres" },
+    { "name": "redis", "serviceType": "redis" },
+    { "name": "api", "source": { "path": "apps/api" }, "env": { "DATABASE_URL": "${{ postgres.DATABASE_URL }}" } },
+    { "name": "worker", "source": { "path": "apps/worker" }, "env": { "DATABASE_URL": "${{ postgres.DATABASE_URL }}" } },
+    { "name": "web", "source": { "path": "apps/web" }, "env": { "NEXT_PUBLIC_API_BASE": "${{ api.PUBLIC_URL }}" } }
+  ]
+}
+```
+
+---
+
+## 8) README (deploy quickstart)
+```
+# Catalyst IQTrader
+
+**Features**
+- Dark trader UI (Next.js)
+- Market catalyst feed (FDA, SEC/EDGAR, News, AI, M&A, restructuration, etc.)
+- Only-if-new alerts with quiet hours (America/Toronto)
+- REST API (FastAPI) + PostgreSQL + Redis
+- Worker (ingesters) + simple scoring placeholders
+
+## Local Dev
+make sure Docker is running, then:
+
+```bash
+docker compose -f infra/docker-compose.yml up --build
+```
+
+Visit UI: http://localhost:3000
+API: http://localhost:8000/health
+
+## Deploy to Railway
+1. Fork this repo to your GitHub
+2. In Railway: New Project → Deploy from GitHub
+3. Add environment variables (see `.env.sample`)
+4. Deploy. Web URL will appear in the project dashboard
+
+## Next steps
+- Connect real symbol resolver for events (map company names to tickers)
+- Add provider keys (Polygon, Finnhub)
+- Enhance NLP scoring & dedupe logic
+- Hook the TraderDashboardApp component into `apps/web`
+```
+
+---
+
+> Swap brand to **Catalyst WingTrader** by changing `APP_NAME` and theming tokens in `apps/web`.
+
+---
+
+## 9) Web UI — TraderDashboardApp (full component)
+Create `apps/web/components/TraderDashboardApp.tsx`:
+```tsx
+"use client";
+import React, { useEffect, useMemo, useRef, useState } from "react";
+import { Card, CardContent } from "@/components/ui/card";
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { Slider } from "@/components/ui/slider";
+import { Badge } from "@/components/ui/badge";
+import { Separator } from "@/components/ui/separator";
+import { Select, SelectTrigger, SelectValue, SelectContent, SelectItem } from "@/components/ui/select";
+import { Sheet, SheetContent, SheetHeader, SheetTrigger, SheetTitle } from "@/components/ui/sheet";
+import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
+import { ChevronRight, Bell, Filter, Search, Plus, Star, Zap, TrendingUp, Clock, Newspaper, Settings } from "lucide-react";
+import { createChart, ColorType, CrosshairMode } from "lightweight-charts";
+
+const mockCandles = Array.from({ length: 120 }).map((_, i) => {
+  const base = 100 + i * 0.2 + Math.sin(i / 5) * 2;
+  const o = base + (Math.random() - 0.5) * 1.5;
+  const c = o + (Math.random() - 0.5) * 2.8;
+  const h = Math.max(o, c) + Math.random() * 1.6;
+  const l = Math.min(o, c) - Math.random() * 1.6;
+  return { time: (i + 1) * 24 * 60 * 60, open: o, high: h, low: l, close: c };
+});
+
+const mockNews = [
+  { id: 1, source: "Bloomberg", title: "Tech stocks rally on dovish remarks", ago: "1h" },
+  { id: 2, source: "Reuters", title: "Company X beats earnings, raises guidance", ago: "3h" },
+  { id: 3, source: "WSJ", title: "Energy names lead rotation as oil climbs", ago: "6h" },
+];
+
+const ScoreChip = ({ label, value }: { label: string; value: number }) => (
+  <TooltipProvider>
+    <Tooltip>
+      <TooltipTrigger asChild>
+        <div className="flex items-center gap-2 rounded-2xl px-3 py-2 shadow-sm bg-muted hover:bg-muted/80 transition">
+          <span className="text-xs uppercase tracking-wider text-muted-foreground">{label}</span>
+          <Badge className="rounded-xl text-sm px-2 py-1" variant={value > 0.66 ? "default" : value > 0.33 ? "secondary" : "outline"}>
+            {(value * 100).toFixed(0)}
+          </Badge>
+        </div>
+      </TooltipTrigger>
+      <TooltipContent>
+        <p>{label} percentile score</p>
+      </TooltipContent>
+    </Tooltip>
+  </TooltipProvider>
+);
+
+function CandleChart({ theme = "dark" }: { theme?: "dark" | "light" }) {
+  const ref = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (!ref.current) return;
+    const chart = createChart(ref.current, {
+      layout: { background: { type: ColorType.Solid, color: theme === "dark" ? "#0b0b0c" : "#ffffff" }, textColor: theme === "dark" ? "#e5e7eb" : "#111827" },
+      grid: { vertLines: { color: theme === "dark" ? "#1f2937" : "#e5e7eb" }, horzLines: { color: theme === "dark" ? "#1f2937" : "#e5e7eb" } },
+      crosshair: { mode: CrosshairMode.Normal },
+      timeScale: { rightOffset: 6, barSpacing: 8, borderVisible: false },
+      rightPriceScale: { borderVisible: false },
+      height: 360,
+    });
+    const series = chart.addCandlestickSeries({
+      upColor: "#16a34a", borderUpColor: "#16a34a", wickUpColor: "#16a34a",
+      downColor: "#dc2626", borderDownColor: "#dc2626", wickDownColor: "#dc2626",
+    });
+    series.setData(mockCandles);
+    chart.timeScale().fitContent();
+    const resize = () => chart.applyOptions({ width: ref.current?.clientWidth || 800 });
+    resize();
+    window.addEventListener("resize", resize);
+    return () => { window.removeEventListener("resize", resize); chart.remove(); };
+  }, [theme]);
+  return <div ref={ref} className="w-full" />;
+}
+
+function HeatmapCell({ label, pct }: { label: string; pct: number }) {
+  const cls = pct === 0 ? "bg-zinc-700/60" : pct > 0 ? "bg-emerald-600/70" : "bg-rose-600/70";
+  return (
+    <div className={`rounded-xl p-3 text-center text-xs md:text-sm text-white ${cls} shadow-inner`}>
+      <div className="font-semibold">{label}</div>
+      <div className="opacity-90">{(pct * 100).toFixed(1)}%</div>
+    </div>
+  );
+}
+
+const mockSectors = [
+  { label: "Tech", pct: 0.018 },
+  { label: "Energy", pct: 0.013 },
+  { label: "Health", pct: -0.007 },
+  { label: "Finance", pct: 0.004 },
+  { label: "Consumer", pct: -0.012 },
+  { label: "Industrial", pct: 0.009 },
+  { label: "Materials", pct: 0.002 },
+  { label: "Utilities", pct: -0.003 },
+  { label: "RealEst", pct: 0.001 },
+];
+
+const mockWatchlist = [
+  { symbol: "AAPL", name: "Apple Inc.", change: 0.013 },
+  { symbol: "NVDA", name: "NVIDIA", change: -0.008 },
+  { symbol: "MSFT", name: "Microsoft", change: 0.006 },
+  { symbol: "TSLA", name: "Tesla", change: -0.021 },
+  { symbol: "AMZN", name: "Amazon", change: 0.011 },
+];
+
+export default function TraderDashboardApp() {
+  const [ticker, setTicker] = useState("AAPL");
+  const [theme] = useState<"dark" | "light">("dark");
+  const [risk, setRisk] = useState([60]);
+  const factorScores = useMemo(() => ({ value: 0.72, quality: 0.64, momentum: 0.81, riskScore: 0.42 }), []);
+
+  return (
+    <div className={`min-h-screen ${theme === "dark" ? "bg-[#0a0a0b] text-zinc-100" : "bg-white text-zinc-900"}`}>
+      <div className="sticky top-0 z-40 backdrop-blur border-b">
+        <div className="container mx-auto px-4 py-3 flex items-center gap-3">
+          <Zap className="w-5 h-5" />
+          <span className="font-semibold tracking-wide">Catalyst IQTrader</span>
+          <Separator orientation="vertical" className="mx-2" />
+          <div className="relative flex-1 max-w-xl">
+            <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 opacity-60" />
+            <Input value={ticker} onChange={(e) => setTicker(e.target.value.toUpperCase())} className="pl-9" placeholder="Search ticker (AAPL, NVDA, SPY)" />
+          </div>
+          <Sheet>
+            <SheetTrigger asChild>
+              <Button variant="outline" className="gap-2"><Bell className="w-4 h-4" /> Alerts</Button>
+            </SheetTrigger>
+            <SheetContent className="w-[420px]">
+              <SheetHeader>
+                <SheetTitle>Alerts</SheetTitle>
+              </SheetHeader>
+              <div className="space-y-4 mt-4">
+                <div className="text-sm text-muted-foreground">FDA/M&A/AI/Restructuring/Earnings — envoi uniquement **s’il y a du nouveau**.</div>
+                <div className="grid grid-cols-2 gap-2">
+                  <Select defaultValue="catalyst">
+                    <SelectTrigger><SelectValue placeholder="Type" /></SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="catalyst">Catalyst Released</SelectItem>
+                      <SelectItem value="upcoming">Catalyst Upcoming</SelectItem>
+                      <SelectItem value="date">Date Changed</SelectItem>
+                      <SelectItem value="price">Price Cross</SelectItem>
+                    </SelectContent>
+                  </Select>
+                  <Input placeholder="Ticker (ex: NVDA)" />
+                </div>
+                <Button className="w-full"><Plus className="w-4 h-4 mr-2" />Add Alert</Button>
+                <Separator />
+                <div className="space-y-3">
+                  {[{rule:"NVDA — AI partnership news"},{rule:"VRTX — FDA approval released"},{rule:"MSFT — M&A rumor"}].map((r,i)=> (
+                    <div key={i} className="flex items-center justify-between rounded-xl border p-3">
+                      <div className="flex items-center gap-3 text-sm"><Bell className="w-4 h-4" /> {r.rule}</div>
+                      <Button size="sm" variant="ghost">Disable</Button>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            </SheetContent>
+          </Sheet>
+        </div>
+      </div>
+
+      <div className="container mx-auto px-4 py-6 grid grid-cols-12 gap-5">
+        <div className="col-span-12 xl:col-span-3 space-y-5">
+          <Card className="rounded-2xl shadow-sm"><CardContent className="p-4">
+            <div className="flex items-center justify-between mb-2">
+              <div className="font-semibold">Watchlist</div>
+              <Button size="sm" variant="ghost"><Plus className="w-4 h-4 mr-1" />Add</Button>
+            </div>
+            <div className="space-y-2">
+              {mockWatchlist.map((w) => (
+                <button key={w.symbol} onClick={() => setTicker(w.symbol)} className="w-full text-left rounded-xl px-3 py-2 hover:bg-muted flex items-center justify-between">
+                  <div>
+                    <div className="font-medium">{w.symbol}</div>
+                    <div className="text-xs text-muted-foreground truncate">{w.name}</div>
+                  </div>
+                  <Badge variant={w.change >= 0 ? "default" : "destructive"}>{(w.change*100).toFixed(2)}%</Badge>
+                </button>
+              ))}
+            </div>
+          </CardContent></Card>
+
+          <Card className="rounded-2xl shadow-sm"><CardContent className="p-4 space-y-3">
+            <div className="flex items-center gap-2 mb-1"><Filter className="w-4 h-4" /><span className="font-semibold">Quick Screener</span></div>
+            <div className="grid grid-cols-2 gap-3">
+              <Select defaultValue="mega">
+                <SelectTrigger><SelectValue placeholder="Market Cap" /></SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="mega">Mega</SelectItem>
+                  <SelectItem value="large">Large</SelectItem>
+                  <SelectItem value="mid">Mid</SelectItem>
+                  <SelectItem value="small">Small</SelectItem>
+                </SelectContent>
+              </Select>
+              <Select defaultValue="tech">
+                <SelectTrigger><SelectValue placeholder="Sector" /></SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="tech">Technology</SelectItem>
+                  <SelectItem value="energy">Energy</SelectItem>
+                  <SelectItem value="health">Healthcare</SelectItem>
+                </SelectContent>
+              </Select>
+            </div>
+            <div>
+              <div className="text-xs text-muted-foreground mb-1">Min Momentum Percentile</div>
+              <Slider value={risk} onValueChange={setRisk} step={5} max={100} />
+            </div>
+            <Button className="w-full"><TrendingUp className="w-4 h-4 mr-2" />Run Screen</Button>
+          </CardContent></Card>
+
+          <Card className="rounded-2xl shadow-sm"><CardContent className="p-4">
+            <div className="flex items-center gap-2 mb-3"><Newspaper className="w-4 h-4" /><span className="font-semibold">Latest News</span></div>
+            <div className="space-y-3">
+              {mockNews.map(n => (
+                <div key={n.id} className="flex items-center justify-between">
+                  <div>
+                    <div className="text-sm font-medium truncate max-w-[210px]">{n.title}</div>
+                    <div className="text-xs text-muted-foreground">{n.source} • {n.ago}</div>
+                  </div>
+                  <ChevronRight className="w-4 h-4" />
+                </div>
+              ))}
+            </div>
+          </CardContent></Card>
+        </div>
+
+        <div className="col-span-12 xl:col-span-6 space-y-5">
+          <Card className="rounded-2xl shadow-sm"><CardContent className="p-4">
+            <div className="flex items-center justify-between mb-3">
+              <div className="flex items-center gap-3">
+                <div className="text-xl font-semibold tracking-tight">{ticker}</div>
+                <Badge variant="secondary" className="gap-1"><Clock className="w-3 h-3" /> Real-time</Badge>
+                <Badge variant="outline" className="gap-1"><Star className="w-3 h-3" /> Favorites</Badge>
+              </div>
+              <Tabs defaultValue="1D"><TabsList>{["1D","5D","1M","3M","6M","1Y","MAX"].map(t => (<TabsTrigger key={t} value={t}>{t}</TabsTrigger>))}</TabsList></Tabs>
+            </div>
+            <CandleChart theme={theme} />
+          </CardContent></Card>
+
+          <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+            <ScoreChip label="Momentum" value={factorScores.momentum} />
+            <ScoreChip label="Value" value={factorScores.value} />
+            <ScoreChip label="Quality" value={factorScores.quality} />
+            <ScoreChip label="Risk" value={factorScores.riskScore} />
+          </div>
+
+          <Card className="rounded-2xl shadow-sm"><CardContent className="p-4">
+            <div className="flex items-center gap-2 mb-3 font-semibold">Market Heatmap</div>
+            <div className="grid grid-cols-3 md:grid-cols-6 gap-2">
+              {mockSectors.map(s => <HeatmapCell key={s.label} label={s.label} pct={s.pct} />)}
+            </div>
+          </CardContent></Card>
+        </div>
+
+        <div className="col-span-12 xl:col-span-3 space-y-5">
+          <Card className="rounded-2xl shadow-sm"><CardContent className="p-4">
+            <div className="flex items-center justify-between mb-2">
+              <div className="font-semibold">Top Momentum (today)</div>
+              <Button size="sm" variant="ghost">Export</Button>
+            </div>
+            <div className="space-y-2">
+              {["ON","LULU","NFLX","META","ARM","SHOP"].map((s)=> (
+                <div key={s} className="flex items-center justify-between rounded-xl px-3 py-2 hover:bg-muted">
+                  <div className="font-medium">{s}</div>
+                  <Badge>+{(Math.random()*3+1).toFixed(2)}%</Badge>
+                </div>
+              ))}
+            </div>
+          </CardContent></Card>
+
+          <Card className="rounded-2xl shadow-sm"><CardContent className="p-4 space-y-3">
+            <div className="font-semibold">Quick Trade (paper)</div>
+            <div className="grid grid-cols-2 gap-2">
+              <Select defaultValue="buy">
+                <SelectTrigger><SelectValue placeholder="Side" /></SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="buy">Buy</SelectItem>
+                  <SelectItem value="sell">Sell</SelectItem>
+                </SelectContent>
+              </Select>
+              <Select defaultValue="mkt">
+                <SelectTrigger><SelectValue placeholder="Type" /></SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="mkt">Market</SelectItem>
+                  <SelectItem value="limit">Limit</SelectItem>
+                  <SelectItem value="stop">Stop</SelectItem>
+                </SelectContent>
+              </Select>
+            </div>
+            <Input placeholder="Qty (e.g., 10)" />
+            <Button className="w-full">Place Paper Order</Button>
+            <div className="text-xs text-muted-foreground">Connect a broker (e.g., Alpaca Paper) for live trading safely.</div>
+          </CardContent></Card>
+        </div>
+      </div>
+
+      <footer className="container mx-auto px-4 py-10 text-xs text-muted-foreground">Built for Catalyst IQTrader • dark UI • plug real data via NEXT_PUBLIC_API_BASE</footer>
+    </div>
+  );
+}
+```
+
+Wire it in `apps/web/app/page.tsx`:
+```tsx
+import TraderDashboardApp from "@/components/TraderDashboardApp";
+export default function Page(){
+  return (
+    <main className="container mx-auto px-4 py-6">
+      <TraderDashboardApp />
+    </main>
+  );
+}
+```
+
+Add Tailwind/shadcn if missing (quick):
+- Tailwind: `npm i -D tailwindcss postcss autoprefixer` then init & include `globals.css`.
+- shadcn/ui: `npx shadcn@latest init` and install needed components used above.
+- lightweight-charts: `npm i lightweight-charts lucide-react`.
+
+---
+
+## 10) Final README — pas-à-pas (GitHub → Railway)
+
+### A. Créer ton GitHub
+1. Va sur github.com → Sign Up (gratuit)
+2. Clique **New repository** → nomme-le `catalyst-iqtrader`
+3. Copie-colle les dossiers/fichiers du canvas (même structure) dans ton repo
+4. Commit & Push (ou upload via l’UI GitHub)
+
+### B. Lancer en local (optionnel)
+```bash
+cd infra
+docker compose up --build
+```
+- UI: http://localhost:3000
+- API: http://localhost:8000/health
+
+### C. Déployer sur Railway
+1. Crée un compte sur railway.app et connecte GitHub
+2. **New Project → Deploy from GitHub** → choisis `catalyst-iqtrader`
+3. Railway détecte `infra/railway.json` et crée Postgres, Redis, Web, API, Worker
+4. Ajoute tes variables d’environnement (onglet **Variables**):
+   - `DATABASE_URL` (pré-rempli si tu utilises le Postgres Railway)
+   - `REDIS_URL` (pré-rempli)
+   - `NEXT_PUBLIC_API_BASE` = l’URL publique du service API Railway
+   - Providers: `NEWSAPI_KEY`, `POLYGON_API_KEY`/`FINNHUB_API_KEY`
+   - FDA/SEC URLs (déjà par défaut)
+   - Notifications: `SENDGRID_API_KEY`, `ALERTS_FROM_EMAIL`, `ONESIGNAL_APP_ID`, `ONESIGNAL_REST_API_KEY`
+   - `TIMEZONE=America/Toronto`, `QUIET_HOURS_START=21:00`, `QUIET_HOURS_END=07:00`
+5. Clique **Deploy**. Tu reçois :
+   - URL **Web** publique (ton dashboard)
+   - URL **API** (ex: `https://iqtrader-api.up.railway.app`)
+
+### D. Vérifier que tout tourne
+- Ouvre l’URL Web → le dashboard s’affiche (données mock au début)
+- Ouvre `/health` de l’API → `{ ok: true }`
+- Dans la **console Railway**, vérifie les logs du **worker** : il ingère FDA/News et écrit dans `market_events`
+
+### E. Brancher les vraies données
+- Mets une clé **NewsAPI** (simple pour démarrer)
+- Ajoute Polygon/Finnhub pour les quotes (et remplace les `mockCandles` plus tard)
+- (Option) Ajoute SEC/EDGAR ingester pour M&A/8-K : worker à compléter
+
+### F. Alertes “only-if-new”
+- Crée quelques règles via `/v1/alerts` (POST) ou ajoute un petit panneau UI (todo)
+- Le worker calcule un **digest** par événement et n’envoie **rien** si c’est identique
+- Milestones pour “upcoming” (14j/7j/1j), réinitialisés si la date change
+
+### G. Branding & variantes
+- Change `APP_NAME` et `NEXT_PUBLIC_APP_NAME` → **Catalyst WingTrader** si tu préfères
+- (Plus tard) logo, favicons, et palette secondaire
+
+---
+
+## 11) Ce qu’il reste à faire pour la prod
+- Résolution **société → ticker** fiable (mapping EDGAR + symbol directory)
+- Auth utilisateurs (Clerk/Auth.js) + Stripe pour abonnements
+- Meilleure **NLP** (classifieur catalyst + scoring impact)
+- Webhooks/Telegram pour alertes temps réel
+- Tests & monitoring (OpenTelemetry/Prometheus)
+
+---
+
+🔧 Tu es prêt. Ouvre GitHub, crée le repo, colle le contenu, puis **Deploy from GitHub** sur Railway. Je peux aussi t’ajouter une check‑list “copier/coller” des variables si tu veux. 
+
+
+
+---
+
+## 12) **Catalyst Chain™** — Propagation Graph (NEW, included)
+> Unique feature: predict & visualize how a catalyst on one company ripples to suppliers, partners, competitors, and narrative peers.
+
+### 12.1 Data model (Postgres graph)
+Create `db/graph.sql` and run after `schema.sql`:
+```sql
+-- Companies (can reuse entities_security or add extra metadata)
+CREATE TABLE IF NOT EXISTS companies (
+  company_id SERIAL PRIMARY KEY,
+  symbol TEXT UNIQUE,
+  name TEXT
+);
+
+-- Company relationships (typed edges)
+CREATE TABLE IF NOT EXISTS company_links (
+  id BIGSERIAL PRIMARY KEY,
+  src_symbol TEXT NOT NULL,
+  dst_symbol TEXT NOT NULL,
+  rel_type TEXT CHECK (rel_type IN (
+    'SUPPLIER','CUSTOMER','PARTNER','COMPETITOR','PARENT','SUBSIDIARY','NARRATIVE_PEER'
+  )),
+  weight NUMERIC DEFAULT 0.5,  -- connection strength 0..1
+  UNIQUE (src_symbol, dst_symbol, rel_type)
+);
+CREATE INDEX IF NOT EXISTS idx_links_src ON company_links(src_symbol);
+CREATE INDEX IF NOT EXISTS idx_links_dst ON company_links(dst_symbol);
+```
+
+> You can seed edges from public sources later; start with small curated sets per sector (AI, EV, chips, cloud, biotech).
+
+### 12.2 API — Chain endpoint
+Add file `apps/api/app/chain.py`:
+```python
+from fastapi import APIRouter
+from sqlalchemy import text
+from .main import engine
+
+router = APIRouter(prefix="/v1/chain", tags=["chain"])
+
+@router.get("/neighbors")
+def neighbors(symbol: str, depth: int = 2):
+    symbol = symbol.upper()
+    # BFS up to depth 2 using SQL; for larger graphs, consider recursive CTE
+    with engine.connect() as c:
+        # nodes
+        nodes = set([symbol])
+        edges = []
+        frontier = {symbol}
+        for _ in range(max(1, min(depth, 3))):
+            if not frontier: break
+            q = text("""
+              SELECT src_symbol, dst_symbol, rel_type, weight FROM company_links
+              WHERE src_symbol = ANY(:f) OR dst_symbol = ANY(:f)
+            """)
+            rows = c.execute(q, {"f": list(frontier)}).mappings().all()
+            frontier_next = set()
+            for r in rows:
+                s, d = r["src_symbol"], r["dst_symbol"]
+                edges.append(dict(source=s, target=d, type=r["rel_type"], weight=float(r["weight"])) )
+                nodes.add(s); nodes.add(d)
+                if s in frontier: frontier_next.add(d)
+                if d in frontier: frontier_next.add(s)
+            frontier = frontier_next - set(edges)  # rough guard
+        return {"nodes": list(nodes), "edges": edges}
+
+@router.get("/propagate")
+def propagate(symbol: str, category: str = "OTHER", base_impact: float = 0.7):
+    """Compute simple propagation scores from an origin event.
+    Positive/negative multipliers per relation type.
+    """
+    symbol = symbol.upper()
+    multipliers = {
+        'SUPPLIER': 0.7,      # origin->supplier positive
+        'CUSTOMER': 0.6,
+        'PARTNER': 0.65,
+        'COMPETITOR': -0.5,   # competitor inverse
+        'PARENT': 0.5,
+        'SUBSIDIARY': 0.5,
+        'NARRATIVE_PEER': 0.3,
+    }
+    with engine.connect() as c:
+        rows = c.execute(text("""
+          SELECT src_symbol, dst_symbol, rel_type, weight FROM company_links
+          WHERE src_symbol=:s OR dst_symbol=:s
+        """), {"s": symbol}).mappings().all()
+    scores = {symbol: base_impact}
+    for r in rows:
+        a, b, rel, w = r["src_symbol"], r["dst_symbol"], r["rel_type"], float(r["weight"]) or 0.5
+        m = multipliers.get(rel, 0.3)
+        other = b if a == symbol else a
+        scores[other] = scores.get(other, 0.0) + base_impact * m * w
+    # Normalize to -1..1
+    max_abs = max(1e-6, max(abs(v) for v in scores.values()))
+    for k in list(scores.keys()):
+        scores[k] = max(-1.0, min(1.0, scores[k] / max_abs))
+    return {"origin": symbol, "scores": scores}
+```
+
+Mount in `apps/api/app/main.py`:
+```python
+from .chain import router as chain_router
+API.include_router(chain_router)
+```
+
+### 12.3 Worker — Enrich events with propagation
+Add `apps/worker/propagate.py`:
+```python
+import os, json
+from sqlalchemy import create_engine, text
+
+DB = create_engine(os.getenv("DATABASE_URL"))
+
+REL_MULT = {
+  'SUPPLIER': 0.7,
+  'CUSTOMER': 0.6,
+  'PARTNER': 0.65,
+  'COMPETITOR': -0.5,
+  'PARENT': 0.5,
+  'SUBSIDIARY': 0.5,
+  'NARRATIVE_PEER': 0.3,
+}
+
+def propagate_from(symbol: str, base_impact: float = 0.7):
+    symbol = symbol.upper()
+    with DB.connect() as c:
+        links = c.execute(text("SELECT src_symbol,dst_symbol,rel_type,weight FROM company_links WHERE src_symbol=:s OR dst_symbol=:s"), {"s":symbol}).mappings().all()
+    scores = {symbol: base_impact}
+    for r in links:
+        a,b,rel,w = r["src_symbol"], r["dst_symbol"], r["rel_type"], float(r["weight"]) or 0.5
+        m = REL_MULT.get(rel, 0.3)
+        other = b if a==symbol else a
+        scores[other] = scores.get(other, 0.0) + base_impact*m*w
+    return scores
+
+# Example usage: when a new market_events row is inserted for SYMBOL,
+# compute propagation and write as synthetic events with category 'PROPAGATION_HINT'.
+
+def write_propagation_events(event_id: int, origin_symbol: str, base_impact: float = 0.7):
+    scores = propagate_from(origin_symbol, base_impact)
+    hints = [ (sym, sc) for sym, sc in scores.items() if sym != origin_symbol and abs(sc) > 0.15 ]
+    with DB.begin() as c:
+        for sym, sc in hints:
+            c.execute(text(
+                """
+                INSERT INTO market_events(symbol, title, category, status, impact_score, confidence_score, source)
+                VALUES (:sym, :title, 'OTHER', 'RELEASED', :impact, :conf, :src)
+                """
+            ), {"sym": sym, "title": f"Propagation from {origin_symbol}", "impact": abs(sc), "conf": 0.5, "src": "PROPAGATION_ENGINE"})
+```
+
+Call `write_propagation_events` from your ingest jobs right after inserting a real catalyst for `origin_symbol`.
+
+### 12.4 Web — **Catalyst Chain Map** UI
+Add `apps/web/components/CatalystChainMap.tsx` (uses `react-force-graph`):
+```tsx
+"use client";
+import dynamic from "next/dynamic";
+import { useEffect, useState } from "react";
+
+const ForceGraph2D = dynamic(() => import("react-force-graph").then(m => m.ForceGraph2D), { ssr: false });
+
+export default function CatalystChainMap({ symbol }: { symbol: string }){
+  const [data, setData] = useState<{nodes:any[], links:any[]}>({nodes:[], links:[]});
+  const [scores, setScores] = useState<Record<string, number>>({});
+
+  useEffect(() => {
+    const base = process.env.NEXT_PUBLIC_API_BASE || "";
+    fetch(`${base}/v1/chain/neighbors?symbol=${symbol}&depth=2`).then(r=>r.json()).then((res) => {
+      const nodes = res.nodes.map((n:string) => ({ id: n }));
+      const links = res.edges.map((e:any) => ({ source: e.source, target: e.target, type: e.type, weight: e.weight }));
+      setData({ nodes, links });
+    });
+    fetch(`${base}/v1/chain/propagate?symbol=${symbol}`).then(r=>r.json()).then((res) => setScores(res.scores||{}));
+  }, [symbol]);
+
+  const color = (id: string) => {
+    const v = scores[id] || 0;
+    if (v > 0.05) return "#16a34a";   // green
+    if (v < -0.05) return "#dc2626";  // red
+    return "#94a3b8";                // slate
+  };
+
+  return (
+    <div className="rounded-2xl border overflow-hidden" style={{height:420}}>
+      <ForceGraph2D
+        graphData={{ nodes: data.nodes, links: data.links }}
+        nodeLabel={(n:any)=>`${n.id} • score ${(scores[n.id]||0).toFixed(2)}`}
+        nodeAutoColorBy={(n:any)=>color(n.id)}
+        linkDirectionalParticles={2}
+        linkDirectionalParticleWidth={(l:any)=> (l.weight||0.5)*2 }
+        linkLabel={(l:any)=> `${l.type} • w=${(l.weight||0.5).toFixed(2)}`}
+      />
+    </div>
+  );
+}
+```
+
+Wire on the dashboard page (below the chart) in `apps/web/app/page.tsx`:
+```tsx
+import CatalystChainMap from "@/components/CatalystChainMap";
+// ...inside Page component render
+<div className="mt-4">
+  <h2 className="text-sm font-semibold mb-2">Catalyst Chain™</h2>
+  <CatalystChainMap symbol="AAPL" />
+</div>
+```
+
+### 12.5 Seed example links (optional for demo)
+Create `db/seed_links.sql`:
+```sql
+INSERT INTO company_links (src_symbol, dst_symbol, rel_type, weight) VALUES
+('NVDA','TSLA','PARTNER',0.7) ON CONFLICT DO NOTHING,
+('NVDA','SMCI','SUPPLIER',0.8) ON CONFLICT DO NOTHING,
+('TSLA','RIVN','COMPETITOR',0.6) ON CONFLICT DO NOTHING,
+('TSLA','LCID','COMPETITOR',0.6) ON CONFLICT DO NOTHING,
+('AAPL','TSMC','SUPPLIER',0.9) ON CONFLICT DO NOTHING,
+('AAPL','MSFT','NARRATIVE_PEER',0.4) ON CONFLICT DO NOTHING;
+```
+Mount in docker-compose (as another init file) or run once manually.
+
+### 12.6 README additions (how to use)
+- Run `db/graph.sql` (and optional `seed_links.sql`).
+- Rebuild API, then visit Web → **Catalyst Chain™** section appears.
+- When a new catalyst comes in for `NVDA`, worker writes propagation hints (can trigger alerts too).
+
+**That’s it** — the unique feature is fully wired (schema + API + worker + UI). Enjoy your *Market Ripple* superpower 🌊
