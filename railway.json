@@ -1,0 +1,16 @@
+{
+  "$schema": "https://railway.app/railway.schema.json",
+  "name": "Catalyst IQTrader API",
+  "services": [
+    {
+      "name": "api",
+      "source": { "path": "." },
+      "dockerfilePath": "Dockerfile",
+      "env": {
+        "TIMEZONE": "America/Toronto",
+        "QUIET_HOURS_START": "21:00",
+        "QUIET_HOURS_END": "07:00"
+      }
+    }
+  ]
+}
