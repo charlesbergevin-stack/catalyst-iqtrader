@@ -1,4 +1,3 @@
-app/main.py
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -14,3 +13,5 @@ API.add_middleware(
 @API.get("/health")
 def health():
     return {"ok": True}
+
+
